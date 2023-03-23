@@ -34,11 +34,13 @@
 /*                                                                                          */
 /********************************************************************************************/
 
+#if defined(__IOS_REMOTEIO__)
+
 #import <AVFoundation/AVFoundation.h>
 #import <AudioToolbox/AudioToolbox.h>
-#include "rt_aeon.h"
-#include "ios_helper.h"
 
+
+#include "RtAudio.h"
 
 //------------------------------------------------------------------------------------------------------------
 
@@ -278,3 +280,5 @@ double
 ios_output_latency_seconds() {
   return (double)AVAudioSession.sharedInstance.outputLatency; 
 }
+
+#endif
