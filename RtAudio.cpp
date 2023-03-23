@@ -427,6 +427,10 @@ const char* rtaudio_api_names[][2] = {
   { "asio"        , "ASIO" },
   { "wasapi"      , "WASAPI" },
   { "ds"          , "DirectSound" },
+  { "remoteio"    , "IOS RemoteIO"},
+  { "sles"        , "Android SLES"},
+  { "oboe"        , "Android Oboe"},
+  { "loop"        , "Loopback"},
   { "dummy"       , "Dummy" },
 };
 
@@ -459,6 +463,18 @@ extern "C" const RtAudio::Api rtaudio_compiled_apis[] = {
 #endif
 #if defined(__WINDOWS_DS__)
   RtAudio::WINDOWS_DS,
+#endif
+#if defined(__IOS_REMOTEIO__)
+  RtAudio::REMOTE_IO;
+#endif
+#if defined(__ANDROID_SLES__)
+  RtAudio::ANDROID_SLES;
+#endif
+#if defined(__ANDROID_OBOE__)
+  RtAudio::ANDROID_OBOE;
+#endif
+#if defined(__RTAUDIO_LOOP__)
+  RtAudio::RTAUDIO_LOOP;
 #endif
 #if defined(__RTAUDIO_DUMMY__)
   RtAudio::RTAUDIO_DUMMY,
@@ -10781,6 +10797,1843 @@ static void *ossCallbackHandler( void *ptr )
 }
 
 //******************** End of __LINUX_OSS__ *********************//
+#endif
+
+//******************** Begin assertfail driver additions *********************//
+
+#if defined(__IOS_REMOTEIO__)
+
+#include <CoreFoundation/CoreFoundation.h>
+#include <AudioToolbox/AudioToolbox.h>
+#include <AudioToolbox/AudioConverter.h>
+#include <TargetConditionals.h>
+
+
+class AudioSessionListener {
+public:
+    virtual ~AudioSessionListener();
+    void enableCallbacks();
+    void disableCallbacks();
+    virtual void audioRouteChanged();
+    virtual void audioInterruptionBegan();
+    virtual void audioInterruptionEnded();
+protected:
+    AudioSessionListener();
+private:
+    void *events;
+};
+
+int                 ios_device_count();
+
+RtAudio::DeviceInfo ios_device_info(int index);
+
+bool                ios_init_session(RtAudio::DeviceInfo);
+
+bool                ios_buffer_size(unsigned int *bufferSize, unsigned int *sampleRate);
+
+double              ios_input_latency_seconds();
+
+double              ios_output_latency_seconds();
+
+#include "core/audiobuffer.h"
+
+#define kOutputBus 0
+#define kInputBus  1
+
+//------------------------------------------------------------------------------------------------------------
+
+OSStatus remoteioInputProc(void *inRefCon,
+                          AudioUnitRenderActionFlags *ioActionFlags,
+                          const AudioTimeStamp *inTimeStamp,
+                          UInt32 inBusNumber,
+                          UInt32 inNumberFrames,
+                          AudioBufferList *ioData);
+
+OSStatus remoteioOutputProc(void *inRefCon,
+                           AudioUnitRenderActionFlags *ioActionFlags,
+                           const AudioTimeStamp *inTimeStamp,
+                           UInt32 inBusNumber,
+                           UInt32 inNumberFrames,
+                           AudioBufferList *ioData);
+
+//------------------------------------------------------------------------------------------------------------
+
+void
+remoteioPrintStreamDesc (const char* title, AudioStreamBasicDescription *inDesc) {
+    
+  if (!inDesc) {
+    TRACE ("Can't print a NULL desc!\n");
+    return;
+  }
+  
+  TRACE ("====== %s ======\n", title);
+  TRACE ("- - - - - - - - - - - - - - - - - - - -\n");
+  TRACE ("  Sample Rate:%f\n", inDesc->mSampleRate);
+  TRACE ("  Format ID:%s\n", (char*)&inDesc->mFormatID);
+  TRACE ("  Format Flags:%lX\n", inDesc->mFormatFlags);
+  TRACE ("  Bytes per Packet:%ld\n", inDesc->mBytesPerPacket);
+  TRACE ("  Frames per Packet:%ld\n", inDesc->mFramesPerPacket);
+  TRACE ("  Bytes per Frame:%ld\n", inDesc->mBytesPerFrame);
+  TRACE ("  Channels per Frame:%ld\n", inDesc->mChannelsPerFrame);
+  TRACE ("  Bits per Channel:%ld\n", inDesc->mBitsPerChannel);
+  TRACE ("- - - - - - - - - - - - - - - - - - - -\n");
+}
+
+//------------------------------------------------------------------------------------------------------------
+
+struct RemoteIOHandle : public AudioSessionListener {
+  
+  AudioComponentInstance      audioUnit;
+  AudioBufferList             *renderBuffer;
+  bool                        initialized;
+  
+  RemoteIOHandle(int audioUnitSubType) :
+    AudioSessionListener(),
+    audioUnit(nullptr),
+    renderBuffer(nullptr),
+    initialized(false) {
+
+    OSStatus                  status=noErr;
+    AudioComponentDescription desc;
+    
+    desc.componentType         = kAudioUnitType_Output;
+    desc.componentSubType      = audioUnitSubType;
+    desc.componentFlags        = 0;
+    desc.componentFlagsMask    = 0;
+    desc.componentManufacturer = kAudioUnitManufacturer_Apple;
+
+    AudioComponent inputComponent = AudioComponentFindNext(NULL, &desc);
+
+    status = AudioComponentInstanceNew(inputComponent, &audioUnit);
+
+    if (status) {
+      TRACE("FATAL: in AudioComponentInstanceNew: %d (noErr: %d)\n", status, noErr);
+      audioUnit = nullptr;
+    }
+
+  }
+
+  ~RemoteIOHandle() {
+    if (audioUnit)
+      AudioComponentInstanceDispose(audioUnit);
+    releaseBuffer(&renderBuffer);
+  }
+
+  OSStatus setupBuffer(UInt32 bufferSizeFrames, int scope, int bus, AudioBufferList **list) {
+  
+    OSStatus err = noErr;
+  
+    UInt32 bufferSizeBytes   = 0;
+    UInt32 propsize          = 0;
+    UInt32 propertySize      = 0;
+    UInt32 numBuffers        = 1;
+      
+    AudioStreamBasicDescription sd;
+
+    if (!list)
+      return -1;
+    
+    if ((*list))
+      releaseBuffer(list);
+
+    propertySize = sizeof(AudioStreamBasicDescription);
+
+    err = AudioUnitGetProperty(
+      audioUnit,
+      kAudioUnitProperty_StreamFormat,
+      scope,
+      bus,
+      &sd,
+      &propertySize);
+    
+    remoteioPrintStreamDesc("StreamFormat", &sd);
+
+    bufferSizeBytes = (bufferSizeFrames * sd.mBytesPerFrame);
+
+    TRACE("bufferSizeFrames: %ld , bufferSizeBytes: %ld\n", bufferSizeFrames, bufferSizeBytes);
+        
+    propsize = offsetof(AudioBufferList, mBuffers[0]) + (sizeof(AudioBuffer) * numBuffers);
+
+    (*list) = (AudioBufferList *)malloc(propsize);
+
+    (*list)->mNumberBuffers = numBuffers;
+  
+    for (UInt32 i =0; i < (*list)->mNumberBuffers ; i++) {
+      (*list)->mBuffers[i].mNumberChannels = sd.mChannelsPerFrame;
+      (*list)->mBuffers[i].mDataByteSize   = bufferSizeBytes * sd.mChannelsPerFrame;
+      (*list)->mBuffers[i].mData           = malloc(bufferSizeBytes);
+    }
+  
+    return err;
+  }
+
+  OSStatus releaseBuffer(AudioBufferList** list) {
+    
+    if ((*list) == NULL)
+      return noErr;
+    
+    for (UInt32 i=0 ; i < (*list)->mNumberBuffers ; i++ ) {
+      if ( (*list)->mBuffers[i].mData != NULL )
+        free  ((*list)->mBuffers[i].mData );
+        
+      (*list)->mBuffers[i].mNumberChannels = 0;
+      (*list)->mBuffers[i].mDataByteSize   = 0;
+      (*list)->mBuffers[i].mData           = NULL;
+    }
+    
+    free ((*list));
+    
+    (*list) = NULL;
+    
+    return noErr;
+  }
+
+  static void formatDescription(int format, int channels, int sampleRate, AudioStreamBasicDescription &sd) {
+    sd.mSampleRate          = sampleRate;
+    sd.mFormatID            = kAudioFormatLinearPCM;
+    sd.mFramesPerPacket     = 1;
+    sd.mChannelsPerFrame    = channels;
+    sd.mFormatFlags         = kAudioFormatFlagIsPacked;
+    
+    switch(format) {
+     case RTAUDIO_SINT8:
+       sd.mFormatFlags         |= kAudioFormatFlagIsSignedInteger;
+       sd.mBitsPerChannel      = 8;
+       sd.mBytesPerPacket      = channels * sizeof(SInt8);
+       sd.mBytesPerFrame       = channels * sizeof(SInt8);
+       break ;
+     case RTAUDIO_SINT16:
+       sd.mFormatFlags         |= kAudioFormatFlagIsSignedInteger;
+       sd.mBitsPerChannel      = 16;
+       sd.mBytesPerPacket      = channels * sizeof(SInt16);
+       sd.mBytesPerFrame       = channels * sizeof(SInt16);
+       break ;
+     case RTAUDIO_SINT24:
+       sd.mFormatFlags         |= kAudioFormatFlagIsSignedInteger;
+       sd.mBitsPerChannel      = 24;
+       sd.mBytesPerPacket      = channels * 3;
+       sd.mBytesPerFrame       = channels * 3; 
+       break ;
+     case RTAUDIO_SINT32:
+       sd.mFormatFlags         |= kAudioFormatFlagIsPacked;
+       sd.mBitsPerChannel      = 32;
+       sd.mBytesPerPacket      = channels * sizeof(SInt32);
+       sd.mBytesPerFrame       = channels * sizeof(SInt32);
+       break ;
+     case RTAUDIO_FLOAT32:
+       sd.mFormatFlags         |= kAudioFormatFlagIsFloat;
+       sd.mBitsPerChannel      = 32;
+       sd.mBytesPerPacket      = channels * sizeof(Float32);
+       sd.mBytesPerFrame       = channels * sizeof(Float32);
+       break ;
+     case RTAUDIO_FLOAT64:
+       sd.mFormatFlags         |= kAudioFormatFlagIsFloat;
+       sd.mBitsPerChannel      = 64;
+       sd.mBytesPerPacket      = channels * sizeof(Float64);
+       sd.mBytesPerFrame       = channels * sizeof(Float64);
+       break;
+    }
+  }
+
+    void audioRouteChanged() override {
+    
+    }
+    void audioInterruptionBegan() override {
+    
+    }
+    void audioInterruptionEnded() override {
+        AudioOutputUnitStart(audioUnit);
+    }
+};
+
+RtApiRemoteIO::RtApiRemoteIO() {
+
+}
+
+RtApiRemoteIO::~RtApiRemoteIO()
+{
+
+}
+
+unsigned int RtApiRemoteIO::getDeviceCount( void )
+{
+  return ios_device_count();
+}
+
+RtAudio::DeviceInfo RtApiRemoteIO::getDeviceInfo( unsigned int device)
+{
+  return ios_device_info(device);
+}
+
+void RtApiRemoteIO::closeStream( void )
+{
+  RemoteIOHandle *handle = (RemoteIOHandle*)stream_.apiHandle;
+  stream_.apiHandle = 0; 
+
+  stream_.mode  = UNINITIALIZED;
+  stream_.state = STREAM_CLOSED;
+
+  if (handle) {
+    delete handle; 
+  }
+  
+}
+
+void RtApiRemoteIO::startStream( void )
+{
+  OSStatus status;
+  RemoteIOHandle *handle = (RemoteIOHandle*)stream_.apiHandle;
+  
+  verifyStream();
+
+  if ( stream_.state == STREAM_RUNNING ) {
+    errorText_ = "RtApiRemoteIO::startStream(): the stream is already running!";
+    error( RtAudioError::WARNING );
+    return;
+  }
+
+  if (!handle->initialized) {
+    status = AudioUnitInitialize(handle->audioUnit);
+    if (status) {
+      errorText_ = "RtApiRemoteIO::startStream() FATAL! in AudioUnitInitialize";
+      error (RtAudioError::DRIVER_ERROR);
+      return ;
+    }
+    handle->initialized=true;
+  }
+    
+  
+  AudioOutputUnitStart(handle->audioUnit);
+  handle->enableCallbacks();
+    
+  stream_.state = STREAM_RUNNING;
+}
+
+void RtApiRemoteIO::stopStream( void )
+{
+  verifyStream();
+  if ( stream_.state == STREAM_STOPPED ) {
+    errorText_ = "RtApiRemoteIO::stopStream(): the stream is already stopped!";
+    error( RtAudioError::WARNING );
+    return;
+  }
+
+  RemoteIOHandle *handle = (RemoteIOHandle*)stream_.apiHandle;
+  
+  handle->disableCallbacks();
+  AudioOutputUnitStop(handle->audioUnit);
+
+  stream_.state = STREAM_STOPPED;
+}
+
+void RtApiRemoteIO::abortStream( void )
+{
+  stopStream();
+}
+
+void RtApiRemoteIO::queryStreamLatency(int *inputLatency, int *outputLatency) {
+  if (inputLatency)
+    *inputLatency = (int) (ios_input_latency_seconds() * (double) stream_.sampleRate);
+  if (outputLatency)
+    *outputLatency = (int) (ios_output_latency_seconds() * (double) stream_.sampleRate);
+}
+
+bool RtApiRemoteIO::probeDeviceOpen( unsigned int device, StreamMode mode,
+                                  unsigned int channels, unsigned int firstChannel,
+                                  unsigned int sampleRate, RtAudioFormat format,
+                                  unsigned int *bufferSize, RtAudio::StreamOptions *options )
+{
+
+  RemoteIOHandle *handle = 0;
+  AudioStreamBasicDescription sd;
+  AURenderCallbackStruct callbackStruct;
+  OSStatus status=noErr;
+  UInt32 flag=0;
+
+  if ( device >= ios_device_count() ) {
+    errorText_ = "RtApiRemoteIO::probeDeviceOpen device ID is out of bounds!";
+    return FAILURE;
+  }
+
+  if ( firstChannel != 0 ) {
+    errorText_ = "RtApiRemoteIO::probeDeviceOpen the device does not support the requested channel count.";
+    return FAILURE;
+  }
+
+  TRACE("RtApiRemoteIO: probeDeviceOpen(mode=%d, channels=%d)\n", mode, channels);
+  
+  stream_.device[mode] = device;
+  stream_.state = STREAM_STOPPED;
+  stream_.callbackInfo.object = (void *)this;
+
+  if ( stream_.apiHandle == 0 ) {
+    
+    try {
+      handle = new RemoteIOHandle(kAudioUnitSubType_RemoteIO);      
+    } catch ( std::bad_alloc& ) {
+      errorText_ = "RtApiRemoteIO::probeDeviceOpen: error allocating Handle memory.";
+      return FAILURE;
+    }
+    fprintf(stderr, "RtApiRemoteIO: Creating new Stream (%d, %d)\n", sampleRate, *bufferSize);
+    stream_.apiHandle = (void *) handle;
+
+    if (device == 0) { // other devices relay on user configuring the audiosession before the engine is initialized
+      if (!ios_init_session(ios_device_info(device))) {
+        errorText_ =  "RtApiRemoteIO::probeDeviceOpen: failed to init session";
+        return FAILURE;
+      }
+    }
+  }
+  else
+    handle = (RemoteIOHandle *)stream_.apiHandle;
+
+
+  if (!ios_buffer_size(bufferSize, &sampleRate)) {
+    errorText_ = "RtApiRemoteIO::probeDeviceOpen: failed to set buffersize/samplerate";
+    return FAILURE;
+  }
+
+  stream_.sampleRate = sampleRate;
+  stream_.bufferSize = *bufferSize;
+
+  TRACE("RtApiRemoteIO: final rate: %u\n buffersize: %u\n", sampleRate, *bufferSize);
+  
+  if (mode == OUTPUT || mode == DUPLEX) {
+    flag=1;
+    status = AudioUnitSetProperty(handle->audioUnit,
+                                  kAudioOutputUnitProperty_EnableIO,
+                                  kAudioUnitScope_Output,
+                                  kOutputBus,
+                                  &flag,
+                                  sizeof(flag));
+    if (status) {
+      TRACE("RtApiRemoteIO: FATAL! in AudioUnitSetProperty, EnableIO\n ");
+      goto error;
+    }
+
+    RemoteIOHandle::formatDescription(format, channels, sampleRate, sd);
+
+    status = AudioUnitSetProperty(handle->audioUnit,
+                                  kAudioUnitProperty_StreamFormat,
+                                  kAudioUnitScope_Input,
+                                  kOutputBus,
+                                  &sd,
+                                  sizeof(sd));
+
+    if (status) {
+      TRACE("RtApiRemoteIO: FATAL! in AudioUnitSetProperty, StreamFormat (Output Scope, Input bus)\n ");
+      goto error;
+    }
+
+    callbackStruct.inputProc       = remoteioOutputProc;
+    callbackStruct.inputProcRefCon = this;
+
+    status = AudioUnitSetProperty(handle->audioUnit,
+                                  kAudioUnitProperty_SetRenderCallback,
+                                  kAudioUnitScope_Global,
+                                  kOutputBus,
+                                  &callbackStruct,
+                                  sizeof(callbackStruct));
+
+    if (status) {
+      TRACE("RtApiRemoteIO: FATAL! in AudioUnitSetProperty, RenderCallback, Global, Output bus\n ");
+      goto error;
+    }
+
+  }
+  
+  if (mode == INPUT || mode == DUPLEX) {
+    
+    flag=1;
+    status = AudioUnitSetProperty(handle->audioUnit,
+                                  kAudioOutputUnitProperty_EnableIO,
+                                  kAudioUnitScope_Input,
+                                  kInputBus,
+                                  &flag,
+                                  sizeof(flag));
+
+    if (status) {
+      TRACE("RtApiRemoteIO: FATAL! in AudioUnitSetProperty, EnableIO: %d\n ", status);
+      goto error;
+    }
+
+    RemoteIOHandle::formatDescription(format, channels, sampleRate, sd);
+
+    status = AudioUnitSetProperty(handle->audioUnit,
+                                  kAudioUnitProperty_StreamFormat,
+                                  kAudioUnitScope_Output,
+                                  kInputBus,
+                                  &sd,
+                                  sizeof(sd));
+
+    if (status) {
+      TRACE("RtApiRemoteIO: FATAL! in AudioUnitSetProperty, StreamFormat, Input Scope, Output bus\n");
+      goto error;
+    }
+    
+    callbackStruct.inputProc       = remoteioInputProc;
+    callbackStruct.inputProcRefCon = handle;
+
+    status = AudioUnitSetProperty(handle->audioUnit,
+                                  kAudioOutputUnitProperty_SetInputCallback,
+                                  kAudioUnitScope_Global,
+                                  kInputBus,
+                                  &callbackStruct,
+                                  sizeof(callbackStruct));
+
+    if (status) {
+      TRACE("RtApiRemoteIO: FATAL! in AudioUnitSetProperty, InputCallback, Global Scope, Input Bus\n");
+      goto error;
+    }
+
+    flag = 0;
+    status = AudioUnitSetProperty(handle->audioUnit,
+                                  kAudioUnitProperty_ShouldAllocateBuffer,
+                                  kAudioUnitScope_Output,
+                                  kInputBus,
+                                  &flag,
+                                  sizeof(flag));
+
+    if (status) {
+      TRACE("RtApiRemoteIO: FATAL! in AudioUnitSetProperty, ShouldAllocateBuffer, Output Scope, Input Bus\n");
+      goto error;
+    }
+    
+    handle->setupBuffer(stream_.bufferSize, kAudioUnitScope_Output, kInputBus, &(handle->renderBuffer));
+    
+  }
+  
+  if (mode == INPUT && stream_.mode == OUTPUT)
+    stream_.mode = DUPLEX;
+  else if (mode == OUTPUT && stream_.mode == INPUT)
+    stream_.mode = DUPLEX;
+  else
+    stream_.mode = mode;
+
+  stream_.latency[mode] = (mode == INPUT ? ios_input_latency_seconds() : ios_output_latency_seconds()) * ((double)sampleRate);
+
+  stream_.doByteSwap[mode] = false;
+
+  stream_.userFormat = stream_.deviceFormat[mode] = format;
+
+  stream_.nDeviceChannels[mode] = stream_.nUserChannels[mode] = channels;
+
+  stream_.channelOffset[mode] = firstChannel;
+
+  stream_.userInterleaved = false;
+  stream_.deviceInterleaved[mode] = false;
+
+  stream_.doConvertBuffer[mode] = false;
+  stream_.userBuffer[mode] = nullptr;
+  stream_.deviceBuffer = nullptr;
+    
+  return SUCCESS;
+
+error:
+  if ( handle ) {
+    delete handle;
+    stream_.apiHandle = 0;
+    stream_.callbackInfo.apiInfo=0;
+  }
+
+  stream_.state = STREAM_CLOSED;
+
+  return FAILURE;
+}
+
+//------------------------------------------------------------------------------------------------------------
+// Callbacks..
+//------------------------------------------------------------------------------------------------------------
+
+bool
+RtApiRemoteIO::callbackEvent(UInt32 numFrames, AudioBufferList *ioData) {
+
+  int cbReturnValue=0;
+
+  /**
+   * NOTE:
+   * When remote IO is requesting less than agreed upon buffersize.
+   * for example when we request a samplerate of 44.1 and the system is currently
+   * running at 48, remote io will request 1882 of 2048 sample on each callback
+   * to do its own internal rate conversion.
+   *
+   * We can either run a ringbuffer on our end
+   * or ignore it and forward the call (now)
+   * or possible forcefully set the sample rate of the system to match
+   *
+   * As soon as we trigger a route change the rate seems to change to the
+   * perferred value we requested earlier
+   */
+  
+  if ( stream_.state == STREAM_STOPPED || stream_.state == STREAM_STOPPING ) 
+    return SUCCESS;
+  
+  if ( stream_.state == STREAM_CLOSED ) {
+    errorText_ = "RtApiRemoteIO::callbackEvent(): the stream is closed ... this shouldn't happen!";
+    error( RtAudioError::WARNING );
+    return false;
+  }
+  
+  CallbackInfo        *info = (CallbackInfo *) &stream_.callbackInfo;
+  RemoteIOHandle      *self = (RemoteIOHandle *)stream_.apiHandle;
+
+  RtAudioStreamStatus status = 0;
+  RtAudioCallback     callback = (RtAudioCallback) info->callback;
+  double              streamTime = getStreamTime();
+  char                *ibufptr=nullptr;
+
+  if (self->renderBuffer)
+    ibufptr = (char*) self->renderBuffer->mBuffers[0].mData;
+
+  cbReturnValue = callback(
+    (char*)ioData->mBuffers[0].mData,
+    ibufptr,
+    numFrames,
+    streamTime, 
+    status, 
+    info->userData );
+  
+  if ( cbReturnValue == 2 ) {
+    stream_.state = STREAM_STOPPING;
+  }
+  
+  return true;
+
+}
+
+bool
+RtApiRemoteIO::notificationEvent(RtAudioNotification notification, const aeon::any &value) {
+    return false;
+}
+
+
+OSStatus remoteioInputProc(void *inRefCon,
+                              AudioUnitRenderActionFlags *ioActionFlags,
+                              const AudioTimeStamp *inTimeStamp,
+                              UInt32 inBusNumber,
+                              UInt32 inNumberFrames,
+                              AudioBufferList *ioData) {
+
+  OSStatus err   = noErr;
+
+  RemoteIOHandle *self = (RemoteIOHandle*)inRefCon;
+
+  if (!self) return noErr;
+      
+  err = AudioUnitRender(
+      self->audioUnit,
+      ioActionFlags,
+      inTimeStamp,
+      inBusNumber,
+      inNumberFrames,
+      self->renderBuffer);
+
+  if (err != noErr && err != -50) {
+    TRACE("RemoteIO: render failed (err: %d) (inNumberFrames: %ld)\n", err, inNumberFrames);
+    return err;
+  }
+
+  return noErr;
+
+}
+
+OSStatus remoteioOutputProc(void *inRefCon,
+                             AudioUnitRenderActionFlags *ioActionFlags,
+                             const AudioTimeStamp *inTimeStamp,
+                             UInt32 inBusNumber,
+                             UInt32 inNumberFrames,
+                             AudioBufferList *ioData) {
+
+  OSStatus err   = noErr;
+
+  RtApiRemoteIO *api = (RtApiRemoteIO*)inRefCon;
+  
+  if (api == nullptr || !api->callbackEvent(inNumberFrames, ioData))
+    return -1;
+  
+  return err;
+
+}
+
+//******************** End of __IOS_REMOTEIO__ *********************//
+#endif
+
+#if defined(__ANDROID_SLES__)
+
+#include <SLES/OpenSLES.h>
+#include <SLES/OpenSLES_Android.h>
+#include <SLES/OpenSLES_AndroidConfiguration.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sched.h>
+
+#include <android/log.h>
+
+#define SLCHANNELS(a) (a==2?(SL_SPEAKER_FRONT_LEFT | SL_SPEAKER_FRONT_RIGHT):SL_SPEAKER_FRONT_CENTER)
+
+struct SLESHandle_ {
+  SLObjectItf                   openSLEngine=nullptr;
+  SLObjectItf                   outputMix=nullptr;
+  SLObjectItf                   outputBufferQueue=nullptr;
+  SLObjectItf                   inputBufferQueue=nullptr;
+  SLAndroidSimpleBufferQueueItf outputBufferQueueInterface=nullptr;
+  SLAndroidSimpleBufferQueueItf inputBufferQueueInterface=nullptr;
+  int16_t                       *fifobuffer=nullptr;
+  int16_t                       *zeros=nullptr;
+  unsigned int                  bufferChannels=0;
+  unsigned int                  samplerate=0;
+  unsigned int                  buffersize=0;
+  unsigned int                  zeroSamples=0;
+  unsigned int                  latencySamples=0;
+  unsigned int                  numBuffers=0;
+  unsigned int                  bufferStep=0;
+  unsigned int                  readBufferIndex=0;
+  unsigned int                  writeBufferIndex=0;
+  bool                          hasOutput=false;
+  bool                          hasInput=false;
+  bool                          foreground=false;
+  bool                          started=false;
+  bool                          didSetAffinity=false;
+
+  void setCurrentCPUAffinity() {
+    
+    pid_t current_thread_id = gettid();
+
+    cpu_set_t cpu_set;
+    CPU_ZERO(&cpu_set);
+
+    int current_cpu_id = sched_getcpu();
+    TRACE("Current CPU ID is %d\n", current_cpu_id);
+    CPU_SET(current_cpu_id, &cpu_set);
+    
+    int result = sched_setaffinity(current_thread_id, sizeof(cpu_set_t), &cpu_set);
+
+    if (result == 0)
+      TRACE("Thread affinity set\n");
+    else
+      TRACE("Error setting thread affinity. Error no: %d\n", result);
+    
+    didSetAffinity=true;
+    
+  }
+
+};
+
+static void RtApiSlesIOInputCallback(SLAndroidSimpleBufferQueueItf caller, void *userptr) {
+  CallbackInfo *info = (CallbackInfo*)userptr;
+  RtApiSles *object  = (RtApiSles*)info->object;
+  SLESHandle *handle = (SLESHandle*)info->apiInfo;
+  short int *buffer = handle->fifobuffer + handle->writeBufferIndex * handle->bufferStep;
+  if (handle->writeBufferIndex < handle->numBuffers - 1) 
+    handle->writeBufferIndex++; 
+  else handle->writeBufferIndex = 0;
+
+  if (!handle->hasOutput) { // When there is no audio output configured.
+    int buffersAvailable = handle->writeBufferIndex - handle->readBufferIndex;
+    if (buffersAvailable < 0) buffersAvailable = handle->numBuffers - (handle->readBufferIndex - handle->writeBufferIndex);
+    if (buffersAvailable * handle->buffersize >= handle->latencySamples) { // if we have enough audio input available
+      object->callbackEvent(handle->fifobuffer + handle->readBufferIndex * handle->bufferStep, handle->buffersize);
+      if (handle->readBufferIndex < handle->numBuffers - 1) handle->readBufferIndex++; else handle->readBufferIndex = 0;
+    };
+  }
+  (*caller)->Enqueue(caller, buffer, (SLuint32)handle->buffersize * handle->bufferChannels * 2);
+}
+
+static void RtApiSlesIOOutputCallback(SLAndroidSimpleBufferQueueItf caller, void *userptr) {
+  CallbackInfo *info = (CallbackInfo*)userptr;
+  RtApiSles *object  = (RtApiSles*)info->object;
+  SLESHandle *handle = (SLESHandle*)info->apiInfo;
+
+  int buffersAvailable = handle->writeBufferIndex - handle->readBufferIndex;
+  if (buffersAvailable < 0) 
+    buffersAvailable = handle->numBuffers - (handle->readBufferIndex - handle->writeBufferIndex);
+
+  short int *output = handle->fifobuffer + handle->readBufferIndex * handle->bufferStep;
+
+  if (handle->hasInput) { // If audio input is enabled.    
+    if (buffersAvailable * handle->buffersize >= handle->latencySamples) { // if we have enough audio input available
+      if (!object->callbackEvent(output, handle->buffersize)) {
+          memset(output, 0, (size_t)handle->buffersize * handle->bufferChannels * 2);
+          handle->zeroSamples += handle->buffersize;
+      } else handle->zeroSamples = 0;
+    } else output = NULL; // dropout, not enough audio input
+  } else { // If audio input is not enabled.
+    short int *audioToGenerate = handle->fifobuffer + handle->writeBufferIndex * handle->bufferStep;
+
+    if (!object->callbackEvent(audioToGenerate, handle->buffersize)) {
+      memset(audioToGenerate, 0, (size_t)handle->buffersize * handle->bufferChannels * 2);
+        handle->zeroSamples += handle->buffersize;
+    } else handle->zeroSamples = 0;
+
+    if (handle->writeBufferIndex < handle->numBuffers - 1) 
+      handle->writeBufferIndex++; 
+    else handle->writeBufferIndex = 0;
+    
+    if ((buffersAvailable + 1) * handle->buffersize < handle->latencySamples) 
+      output = NULL; // dropout, not enough audio generated
+  };
+
+  if (output) {
+    if (handle->readBufferIndex < handle->numBuffers - 1) handle->readBufferIndex++; else handle->readBufferIndex = 0;
+  };
+  (*caller)->Enqueue(caller, output ? output : handle->zeros, (SLuint32)handle->buffersize * handle->bufferChannels * 2);
+
+  if (!handle->foreground && (handle->zeroSamples > handle->samplerate)) {
+    handle->zeroSamples = 0;
+    object->stopQueue(handle);
+  };
+}
+
+RtApiSles::RtApiSles() {
+}
+
+RtApiSles::~RtApiSles()
+{
+}
+
+unsigned int RtApiSles::getDeviceCount( void )
+{
+  return 1;
+}
+
+RtAudio::DeviceInfo RtApiSles::getDeviceInfo( unsigned int device)
+{
+  static RtAudio::DeviceInfo info;
+  info.probed = false;
+  info.name = "Android";
+  info.uid = "android:sles";
+  info.outputChannels = 2;
+  info.inputChannels  = 2;
+  info.duplexChannels = 2;
+  info.isDefaultOutput = true;
+  info.isDefaultInput  = true;
+  info.sampleRates.push_back(SL_SAMPLINGRATE_8       / 1000L);
+  info.sampleRates.push_back(SL_SAMPLINGRATE_11_025  / 1000L);
+  info.sampleRates.push_back(SL_SAMPLINGRATE_12      / 1000L);
+  info.sampleRates.push_back(SL_SAMPLINGRATE_16      / 1000L);
+  info.sampleRates.push_back(SL_SAMPLINGRATE_22_05   / 1000L);
+  info.sampleRates.push_back(SL_SAMPLINGRATE_24      / 1000L);
+  info.sampleRates.push_back(SL_SAMPLINGRATE_32      / 1000L);
+  info.sampleRates.push_back(SL_SAMPLINGRATE_44_1    / 1000L);
+  info.sampleRates.push_back(SL_SAMPLINGRATE_48      / 1000L);
+  info.nativeFormats = RTAUDIO_SINT16;
+  return info;
+}
+
+void RtApiSles::closeStream( void )
+{
+  SLESHandle *handle = (SLESHandle*)stream_.apiHandle;
+  stream_.apiHandle = 0; 
+  stream_.callbackInfo.apiInfo = 0;
+
+  for ( int i=0; i<2; i++ ) {
+    if ( stream_.userBuffer[i] ) {
+      free( stream_.userBuffer[i] );
+      stream_.userBuffer[i] = 0;
+    }
+  }
+
+  if ( stream_.deviceBuffer ) {
+    free( stream_.deviceBuffer );
+    stream_.deviceBuffer = 0;
+  }
+
+  stream_.mode  = UNINITIALIZED;
+  stream_.state = STREAM_CLOSED;
+
+  if (handle) {
+    fprintf(stderr, "Closing SLES Stream\n");
+    stopQueue(handle);
+    usleep(100000);
+    if (handle->outputBufferQueue) 
+      (*handle->outputBufferQueue)->Destroy(handle->outputBufferQueue);
+    if (handle->inputBufferQueue) 
+      (*handle->inputBufferQueue)->Destroy(handle->inputBufferQueue);
+    
+    (*handle->outputMix)->Destroy(handle->outputMix);
+    (*handle->openSLEngine)->Destroy(handle->openSLEngine);
+    
+    free(handle->fifobuffer);
+    free(handle->zeros);
+    
+    delete handle; 
+  }
+  
+}
+
+void RtApiSles::startStream( void )
+{
+    verifyStream();
+  if ( stream_.state == STREAM_RUNNING ) {
+    errorText_ = "RtApiSles::startStream(): the stream is already running!";
+    error( RtAudioError::WARNING );
+    return;
+  }
+
+  startQueue((SLESHandle*)stream_.apiHandle);
+  stream_.state = STREAM_RUNNING;
+}
+
+void RtApiSles::stopStream( void )
+{
+  verifyStream();
+  if ( stream_.state == STREAM_STOPPED ) {
+    errorText_ = "RtApiSles::stopStream(): the stream is already stopped!";
+    error( RtAudioError::WARNING );
+    return;
+  }
+
+  stopQueue((SLESHandle*)stream_.apiHandle);
+  stream_.state = STREAM_STOPPED;
+}
+
+void RtApiSles::abortStream( void )
+{
+  verifyStream();
+  if ( stream_.state == STREAM_STOPPED ) {
+    errorText_ = "RtApiSles::stopStream(): the stream is already stopped!";
+    error( RtAudioError::WARNING );
+    return;
+  }
+
+  stopStream();
+}
+
+static void
+printBuffer_(const char* name, const char *buffer, unsigned int length) {
+  fprintf(stderr, "--------------------- %s ---------------------\n", name);
+  for (int i=0 ; i < length && buffer ; i++)
+    fprintf(stderr, "%02X%s", buffer[i], ((i%32)==0)?"\n":" ");
+  fprintf(stderr, "----------------------------------------------\n");
+}
+
+
+
+bool RtApiSles::callbackEvent(int16_t *buffer, int numFrames) {
+
+  
+  if ( stream_.state == STREAM_STOPPED || stream_.state == STREAM_STOPPING ) 
+    return SUCCESS;
+  
+  if ( stream_.state == STREAM_CLOSED ) {
+    errorText_ = "RtApiSles::callbackEvent(): the stream is closed ... this shouldn't happen!";
+    error( RtAudioError::WARNING );
+    return false;
+  }
+
+  if ( stream_.bufferSize != numFrames ) {
+    errorText_ = "RtApiCore::callbackEvent(): the SLES size has changed ... cannot process!";
+    error( RtAudioError::WARNING );
+    return false;
+  }
+
+  CallbackInfo *info = (CallbackInfo *) &stream_.callbackInfo;
+  SLESHandle *handle = (SLESHandle *) stream_.apiHandle;
+
+  if (!handle->didSetAffinity)
+    handle->setCurrentCPUAffinity();
+  
+  RtAudioStreamStatus status = 0;
+  RtAudioCallback callback = (RtAudioCallback) info->callback;
+  double streamTime = getStreamTime();
+
+  if (handle->hasInput) {    
+    if (stream_.doConvertBuffer[1]) {
+      convertBuffer(stream_.userBuffer[1], (char*)buffer, stream_.convertInfo[1]);
+    } else {
+      fprintf(stderr, "Dunno how to copy input buffer yet\n");
+    }
+  }
+
+  int cbReturnValue = callback(
+    stream_.userBuffer[0], // output
+    stream_.userBuffer[1], // input
+    stream_.bufferSize, 
+    streamTime, 
+    status, 
+    info->userData );
+
+#if 0   
+  //Debug.. wipe buffer before conversion
+  if (stream_.mode == DUPLEX)
+    memset(buffer, 0, numFrames * stream_.nDeviceChannels[0] * sizeof(int16_t));
+#endif
+
+  if (handle->hasOutput) {
+    if (stream_.doConvertBuffer[0]) {
+      convertBuffer((char*)buffer, stream_.userBuffer[0], stream_.convertInfo[0]);      
+    } else {
+      fprintf(stderr, "Dunno how to copy output buffer yet\n");
+    }
+  }
+
+  //printBuffer_("device", (const char*)buffer, 64);
+  if ( cbReturnValue == 2 ) {
+    stream_.state = STREAM_STOPPING;
+  }
+
+  return true;
+}
+
+void
+RtApiSles::startQueue(SLESHandle *handle) {
+  if (handle->started) return;
+  handle->started = true;
+  if (handle->inputBufferQueue) {
+    SLRecordItf recordInterface;
+    (*handle->inputBufferQueue)->GetInterface(handle->inputBufferQueue, SL_IID_RECORD, &recordInterface);
+    (*recordInterface)->SetRecordState(recordInterface, SL_RECORDSTATE_RECORDING);
+  };
+  if (handle->outputBufferQueue) {
+    SLPlayItf outputPlayInterface;
+    (*handle->outputBufferQueue)->GetInterface(handle->outputBufferQueue, SL_IID_PLAY, &outputPlayInterface);
+    (*outputPlayInterface)->SetPlayState(outputPlayInterface, SL_PLAYSTATE_PLAYING);
+  };
+}
+
+void 
+RtApiSles::stopQueue(SLESHandle *handle) {
+  if (!handle->started) return;
+  handle->started = false;
+  if (handle->outputBufferQueue) {
+    SLPlayItf outputPlayInterface;
+    (*handle->outputBufferQueue)->GetInterface(handle->outputBufferQueue, SL_IID_PLAY, &outputPlayInterface);
+    (*outputPlayInterface)->SetPlayState(outputPlayInterface, SL_PLAYSTATE_STOPPED);
+  };
+  if (handle->inputBufferQueue) {
+    SLRecordItf recordInterface;
+    (*handle->inputBufferQueue)->GetInterface(handle->inputBufferQueue, SL_IID_RECORD, &recordInterface);
+    (*recordInterface)->SetRecordState(recordInterface, SL_RECORDSTATE_STOPPED);
+  };
+}
+
+bool RtApiSles :: probeDeviceOpen( unsigned int device, StreamMode mode, unsigned int channels,
+                                   unsigned int firstChannel, unsigned int sampleRate,
+                                   RtAudioFormat format, unsigned int *bufferSize,
+                                   RtAudio::StreamOptions *options )
+{
+  static const SLboolean requireds[2] = { SL_BOOLEAN_TRUE, SL_BOOLEAN_FALSE };
+  static int inputStreamType = -1;
+  static int outputStreamType = -1;
+
+  SLESHandle *handle = 0;
+
+  if ( device != 0 ) {
+    // This should not happen because a check is made before this function is called.
+    errorText_ = "RtApiSles::probeDeviceOpen: device ID is invalid!";
+    return FAILURE;
+  }
+
+  if ( channels != 2 || firstChannel != 0 ) {
+    errorText_ = "RtApiSles::probeDeviceOpen: the device does not support the requested channel count.";
+    return FAILURE;
+  }
+
+  stream_.doByteSwap[mode] = false;
+
+  stream_.userFormat = format;
+
+  stream_.deviceFormat[mode] = RTAUDIO_SINT16;
+
+  stream_.nDeviceChannels[mode] = 2;
+
+  stream_.nUserChannels[mode] = channels;
+
+  stream_.channelOffset[mode] = firstChannel;
+
+  stream_.userInterleaved = false;
+  stream_.deviceInterleaved[mode] = false;
+
+  stream_.doConvertBuffer[mode] = 
+    (format != RTAUDIO_SINT16 || channels != 2);
+  
+  fprintf(stderr, "RtApiSles: Buffer conversion for mode: %d is %d\n", mode, stream_.doConvertBuffer[mode]);
+
+  stream_.sampleRate = sampleRate;
+  stream_.bufferSize = *bufferSize;
+  stream_.device[mode] = device;
+  stream_.state = STREAM_STOPPED;
+  stream_.callbackInfo.object = (void *) this;
+
+  if ( stream_.apiHandle == 0 ) {
+    try {
+      handle = new SLESHandle();
+    } catch ( std::bad_alloc& ) {
+      errorText_ = "RtApiSles::probeDeviceOpen: error allocating SLESHandle memory.";
+      return FAILURE;
+    }
+    fprintf(stderr, "RtApiSles: Creating new SLES Stream (%d, %d)\n", sampleRate, *bufferSize);
+    memset(handle, 0, sizeof(SLESHandle));
+    handle->samplerate = sampleRate;
+    handle->buffersize = stream_.bufferSize;
+    handle->hasInput=false;
+    handle->hasOutput=false;
+    handle->bufferChannels = stream_.nDeviceChannels[mode];
+    handle->foreground = true;
+    handle->started = false;
+    handle->zeros = (int16_t *)malloc((size_t)(handle->buffersize * handle->bufferChannels * 2));
+    memset(handle->zeros, 0, (size_t)(handle->buffersize * handle->bufferChannels * 2));
+    handle->latencySamples = handle->buffersize;
+
+    handle->numBuffers = (handle->latencySamples / handle->buffersize) * 2;
+
+    if (handle->numBuffers < 32) 
+      handle->numBuffers = 32;
+    
+    handle->bufferStep = (handle->buffersize + 64) * handle->bufferChannels;
+
+    fprintf(stderr, "NumBuffers: %d step: %d\n", handle->numBuffers, handle->bufferStep);
+
+    size_t fifoBufferSizeBytes = handle->numBuffers * handle->bufferStep * sizeof(int16_t);
+    handle->fifobuffer = (int16_t*)malloc(fifoBufferSizeBytes);
+    memset(handle->fifobuffer, 0, fifoBufferSizeBytes);
+
+    // Create the OpenSL ES engine.
+    slCreateEngine(&handle->openSLEngine, 0, NULL, 0, NULL, NULL);
+    (*handle->openSLEngine)->Realize(handle->openSLEngine, SL_BOOLEAN_FALSE);
+    SLEngineItf openSLEngineInterface = NULL;
+    (*handle->openSLEngine)->GetInterface(handle->openSLEngine, SL_IID_ENGINE, &openSLEngineInterface);
+    // Create the output mix.
+    (*openSLEngineInterface)->CreateOutputMix(openSLEngineInterface, &handle->outputMix, 0, NULL, NULL);
+    (*handle->outputMix)->Realize(handle->outputMix, SL_BOOLEAN_FALSE);
+    SLDataLocator_OutputMix outputMixLocator = { SL_DATALOCATOR_OUTPUTMIX, handle->outputMix };
+
+    SLDataLocator_IODevice deviceInputLocator = { SL_DATALOCATOR_IODEVICE, SL_IODEVICE_AUDIOINPUT, SL_DEFAULTDEVICEID_AUDIOINPUT, NULL };
+    SLDataSource inputSource = { &deviceInputLocator, NULL };
+    SLDataLocator_AndroidSimpleBufferQueue inputLocator = { SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE, 1 };
+    SLDataFormat_PCM inputFormat = { SL_DATAFORMAT_PCM, handle->bufferChannels, (SLuint32)sampleRate * 1000, SL_PCMSAMPLEFORMAT_FIXED_16, SL_PCMSAMPLEFORMAT_FIXED_16, SLCHANNELS(handle->bufferChannels), SL_BYTEORDER_LITTLEENDIAN };
+    SLDataSink inputSink = { &inputLocator, &inputFormat };
+    const SLInterfaceID inputInterfaces[2] = { SL_IID_ANDROIDSIMPLEBUFFERQUEUE, SL_IID_ANDROIDCONFIGURATION };
+    (*openSLEngineInterface)->CreateAudioRecorder(openSLEngineInterface, &handle->inputBufferQueue, &inputSource, &inputSink, 2, inputInterfaces, requireds);
+
+    if (inputStreamType == -1) 
+      inputStreamType = (int)SL_ANDROID_RECORDING_PRESET_VOICE_RECOGNITION;
+    if (inputStreamType > -1) {
+      SLAndroidConfigurationItf inputConfiguration;
+      if ((*handle->inputBufferQueue)->GetInterface(handle->inputBufferQueue, SL_IID_ANDROIDCONFIGURATION, &inputConfiguration) == SL_RESULT_SUCCESS) {
+        SLuint32 st = (SLuint32)inputStreamType;
+        (*inputConfiguration)->SetConfiguration(inputConfiguration, SL_ANDROID_KEY_RECORDING_PRESET, &st, sizeof(SLuint32));
+      };
+    };
+        
+    (*handle->inputBufferQueue)->Realize(handle->inputBufferQueue, SL_BOOLEAN_FALSE);
+    
+
+    SLDataLocator_AndroidSimpleBufferQueue outputLocator = { SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE, 1 };
+    SLDataFormat_PCM outputFormat = { SL_DATAFORMAT_PCM, handle->bufferChannels, (SLuint32)sampleRate * 1000, SL_PCMSAMPLEFORMAT_FIXED_16, SL_PCMSAMPLEFORMAT_FIXED_16, SLCHANNELS(handle->bufferChannels), SL_BYTEORDER_LITTLEENDIAN };
+    SLDataSource outputSource = { &outputLocator, &outputFormat };
+    const SLInterfaceID outputInterfaces[2] = { SL_IID_BUFFERQUEUE, SL_IID_ANDROIDCONFIGURATION };
+    SLDataSink outputSink = { &outputMixLocator, NULL };
+    (*openSLEngineInterface)->CreateAudioPlayer(openSLEngineInterface, &handle->outputBufferQueue, &outputSource, &outputSink, 2, outputInterfaces, requireds);
+
+    if (outputStreamType > -1) {
+      SLAndroidConfigurationItf outputConfiguration;
+      if ((*handle->outputBufferQueue)->GetInterface(handle->outputBufferQueue, SL_IID_ANDROIDCONFIGURATION, &outputConfiguration) == SL_RESULT_SUCCESS) {
+        SLint32 st = (SLint32)outputStreamType;
+        (*outputConfiguration)->SetConfiguration(outputConfiguration, SL_ANDROID_KEY_STREAM_TYPE, &st, sizeof(SLint32));
+      };
+    };
+
+    (*handle->outputBufferQueue)->Realize(handle->outputBufferQueue, SL_BOOLEAN_FALSE);
+  
+    stream_.apiHandle = (void *) handle;
+  }
+  else
+    handle = (SLESHandle *) stream_.apiHandle;
+
+  stream_.callbackInfo.apiInfo = handle;
+
+  if (mode == INPUT || mode == DUPLEX) {
+    fprintf(stderr, "enabling input\n");
+    handle->hasInput = true;
+    (*handle->inputBufferQueue)->GetInterface(handle->inputBufferQueue, SL_IID_ANDROIDSIMPLEBUFFERQUEUE, &handle->inputBufferQueueInterface);
+    (*handle->inputBufferQueueInterface)->RegisterCallback(handle->inputBufferQueueInterface, RtApiSlesIOInputCallback, &(stream_.callbackInfo));
+    (*handle->inputBufferQueueInterface)->Enqueue(handle->inputBufferQueueInterface, handle->fifobuffer, (SLuint32)handle->buffersize * handle->bufferChannels * 2);
+    stream_.latency[INPUT] = 0; // unknown
+  }
+
+  if (mode == OUTPUT || mode == DUPLEX) {
+    fprintf(stderr, "enabling output\n");
+    handle->hasOutput = true;
+    (*handle->outputBufferQueue)->GetInterface(handle->outputBufferQueue, SL_IID_BUFFERQUEUE, &handle->outputBufferQueueInterface);
+    (*handle->outputBufferQueueInterface)->RegisterCallback(handle->outputBufferQueueInterface, RtApiSlesIOOutputCallback, &(stream_.callbackInfo));
+    (*handle->outputBufferQueueInterface)->Enqueue(handle->outputBufferQueueInterface, handle->fifobuffer, (SLuint32)handle->buffersize * handle->bufferChannels * 2);
+    stream_.latency[OUTPUT] = 0; // unknown
+  };
+  
+  if (mode == INPUT && stream_.mode == OUTPUT)
+    stream_.mode = DUPLEX;
+  else if (mode == OUTPUT && stream_.mode == INPUT)
+    stream_.mode = DUPLEX;
+  else
+    stream_.mode = mode;
+
+  if ( stream_.doConvertBuffer[mode] )
+    setConvertInfo( mode, 0 );
+
+  // Allocate necessary internal buffers.
+  unsigned long bufferBytes;
+  bufferBytes = stream_.nUserChannels[mode] * stream_.bufferSize * formatBytes( stream_.userFormat );  
+  stream_.userBuffer[mode] = (char *) calloc( bufferBytes, 1 );
+  if ( stream_.userBuffer[mode] == NULL ) {
+    errorText_ = "RtApiSles::probeDeviceOpen: error allocating user buffer memory.";
+    goto error;
+  }
+
+  if ( stream_.doConvertBuffer[mode] ) {
+
+    bool makeBuffer = true;
+    if ( mode == OUTPUT )
+      bufferBytes = stream_.nDeviceChannels[0] * formatBytes( stream_.deviceFormat[0] );
+    else { // mode == INPUT
+      bufferBytes = stream_.nDeviceChannels[1] * formatBytes( stream_.deviceFormat[1] );
+      if ( stream_.mode == OUTPUT && stream_.deviceBuffer ) {
+        unsigned long bytesOut = stream_.nDeviceChannels[0] * formatBytes(stream_.deviceFormat[0]);
+        if ( bufferBytes < bytesOut ) makeBuffer = false;
+      }
+    }
+
+    if ( makeBuffer ) {
+      bufferBytes *= *bufferSize;
+      if ( stream_.deviceBuffer ) free( stream_.deviceBuffer );
+      stream_.deviceBuffer = (char *) calloc( bufferBytes, 1 );
+      if ( stream_.deviceBuffer == NULL ) {
+        errorText_ = "RtApiSles::probeDeviceOpen: error allocating device buffer memory.";
+        goto error;
+      }
+    }
+  }
+
+  return SUCCESS;
+
+error:
+  if ( handle ) {
+    delete handle;
+    stream_.apiHandle = 0;
+    stream_.callbackInfo.apiInfo=0;
+  }
+
+  for ( int i=0; i<2; i++ ) {
+    if ( stream_.userBuffer[i] ) {
+      free( stream_.userBuffer[i] );
+      stream_.userBuffer[i] = 0;
+    }
+  }
+
+  if ( stream_.deviceBuffer ) {
+    free( stream_.deviceBuffer );
+    stream_.deviceBuffer = 0;
+  }
+
+  stream_.state = STREAM_CLOSED;
+  
+  return FAILURE;
+
+}
+
+//******************** End of __ANDROID_SLES__ *********************//
+#endif
+
+#if defined(__ANDROID_OBOE__)
+
+#include "oboe/Oboe.h"
+#include <android/log.h>
+
+
+using namespace oboe;
+
+class OboeHandle : public AudioStreamCallback {
+public:
+  
+  OboeHandle() : AudioStreamCallback() {}
+  virtual ~OboeHandle() {}
+
+  DataCallbackResult onAudioReady(AudioStream *ioStream, void *data, int32_t numFrames) override {
+
+    RtApiOboe  *object = (RtApiOboe*)info->object;
+    OboeHandle *self   = (OboeHandle*)info->apiInfo;
+
+    if (outputStream) { // duplexing
+      if (inputStream) { // fill buffer from input
+        /**
+         * TODO. this should check that bytes were actually read and
+         * and use device buffer for storage
+         */
+        if(!inputStream->read(data, numFrames, 0))
+          TRACE("input.read() failed\n");
+      }
+    }    
+    
+    if (!object->callbackEvent(data, numFrames))
+      return DataCallbackResult::Stop;
+    
+    return DataCallbackResult::Continue;
+  }
+
+  void onErrorBeforeClose(AudioStream *stream, Result error) override {
+    TRACE("onErrorBeforeClose()\n");
+  }
+
+  void onErrorAfterClose(AudioStream *stream, Result error) override {
+    TRACE("onErrorAfterClose()\n");
+  }
+
+  void startStream(AudioStream *s, bool sync=false) {
+    if (!s) return ;
+    StreamState ss = s->getState();
+    
+    if (ss == StreamState::Started)
+      return ;
+    if (ss == StreamState::Starting)
+      return ;
+    if (ss == StreamState::Closed)
+      return ;
+
+    if (!sync) {
+      s->requestStart();
+      return ;
+    }
+    
+    if (ss == StreamState::Uninitialized)
+      return ;
+    
+    s->start();
+  }
+
+  void stopStream(AudioStream *s, bool sync=false) {
+    if (!s) return ;
+    StreamState ss = s->getState();
+    Direction ds = s->getDirection();
+    
+    if (ss == StreamState::Uninitialized )
+      return ;
+    if (ss == StreamState::Stopped)
+      return ;
+    if (ss == StreamState::Stopping)
+      return ;
+    if (ss == StreamState::Closed)
+      return ;
+    
+    if (!sync) {
+      if (ds == Direction::Output)
+        s->requestFlush();
+      s->requestStop();
+      return ;
+    }
+    if (ds == Direction::Output)
+      s->flush();
+    s->stop();
+  }
+
+  void closeStream(AudioStream *s) {
+    if (!s) return ;
+    StreamState ss = s->getState();
+    if (ss == StreamState::Uninitialized || ss == StreamState::Closed)
+      return ;
+    if (ss != StreamState::Stopped)
+      stopStream(s, true);
+    s->close();
+  }
+
+  void start() {
+    startStream(inputStream);
+    startStream(outputStream);
+  }
+
+  void stop() {
+    stopStream(outputStream);
+    stopStream(inputStream);
+  }
+
+  void close() {
+    closeStream(inputStream);
+    closeStream(outputStream);
+  }
+
+  void abort() {
+    stopStream(outputStream, true);
+    stopStream(inputStream, true);
+  }
+  
+  /**
+   * pointer to rt / oboe shared object */
+  CallbackInfo *info=nullptr;
+  /**
+   * OboeStreams */
+  AudioStream  *outputStream=nullptr;
+  AudioStream  *inputStream =nullptr;
+
+  unsigned int frameSizeBytes[2]={0,0};
+};
+
+RtApiOboe::RtApiOboe() {
+
+}
+
+RtApiOboe::~RtApiOboe()
+{
+
+}
+
+unsigned int RtApiOboe::getDeviceCount( void )
+{
+  return 1;
+}
+
+RtAudio::DeviceInfo RtApiOboe::getDeviceInfo( unsigned int device)
+{
+  /**
+   * We have to query AudioManager java class
+   * via JNI to index devices*/
+  static RtAudio::DeviceInfo info;
+  info.probed = false;
+  info.name = "Oboe";
+  info.uid = "android:oboe";
+  info.outputChannels = 2;
+  info.inputChannels  = 2;
+  info.duplexChannels = 0;
+  info.isDefaultOutput = true;
+  info.isDefaultInput  = true;
+  info.sampleRates.push_back(48000);
+  info.nativeFormats = RTAUDIO_SINT16;
+  return info;
+}
+
+void RtApiOboe::closeStream( void ) {
+
+  OboeHandle *self;
+
+  if (stream_.state == STREAM_RUNNING)
+    abortStream();
+  
+  stream_.apiHandle = 0; 
+  stream_.callbackInfo.apiInfo = 0;
+
+  for ( int i=0; i<2; i++ ) {
+    if ( stream_.userBuffer[i] ) {
+      free( stream_.userBuffer[i] );
+      stream_.userBuffer[i] = 0;
+    }
+  }
+
+  if ( stream_.deviceBuffer ) {
+    free( stream_.deviceBuffer );
+    stream_.deviceBuffer = 0;
+  }
+
+  stream_.mode  = UNINITIALIZED;
+  stream_.state = STREAM_CLOSED;
+
+  if ((self = (OboeHandle*)stream_.apiHandle)) {
+    self->close();
+    fprintf(stderr, "Closing Oboe Streams\n");
+    delete self;
+  }
+}
+
+void RtApiOboe::startStream( void )
+{
+  OboeHandle *self;
+  verifyStream();
+  if ( stream_.state == STREAM_RUNNING ) {
+    errorText_ = "RtApiOboe::startStream(): the stream is already running!";
+    error( RtAudioError::WARNING );
+    return;
+  }
+
+  if ((self = (OboeHandle*)stream_.apiHandle))
+    self->start();
+  
+  stream_.state = STREAM_RUNNING;
+}
+
+void RtApiOboe::stopStream( void )
+{
+  OboeHandle *self;
+  verifyStream();
+  if ( stream_.state == STREAM_STOPPED ) {
+    errorText_ = "RtApiOboe::stopStream(): the stream is already stopped!";
+    error( RtAudioError::WARNING );
+    return;
+  }
+
+  if ((self = (OboeHandle*)stream_.apiHandle))
+    self->stop();
+  stream_.state = STREAM_STOPPED;
+}
+
+void RtApiOboe::abortStream( void )
+{
+  OboeHandle *self;
+  verifyStream();
+  if ( stream_.state == STREAM_STOPPED ) {
+    errorText_ = "RtApiOboe::stopStream(): the stream is already stopped!";
+    error( RtAudioError::WARNING );
+    return;
+  }
+  if ((self = (OboeHandle*)stream_.apiHandle))
+    self->abort();
+  stream_.state = STREAM_STOPPED;
+}
+
+bool
+RtApiOboe::callbackEvent(void *buffer, int numFrames ) {
+  
+  if ( stream_.state == STREAM_STOPPED || stream_.state == STREAM_STOPPING ) 
+    return SUCCESS;
+  
+  if ( stream_.state == STREAM_CLOSED ) {
+    errorText_ = "RtApiOboe::callbackEvent(): the stream is closed ... this shouldn't happen!";
+    error( RtAudioError::WARNING );
+    return false;
+  }
+
+  if ( stream_.bufferSize != numFrames ) {
+    errorText_ = "RtApiCore::callbackEvent(): the Oboe buffer size has changed ... cannot process!";
+    error( RtAudioError::WARNING );
+    return false;
+  }
+
+  CallbackInfo *info = (CallbackInfo *) &stream_.callbackInfo;
+  OboeHandle   *self = (OboeHandle *) stream_.apiHandle;
+
+  RtAudioStreamStatus status = 0;
+  RtAudioCallback     callback = (RtAudioCallback) info->callback;
+  double              streamTime = getStreamTime();
+
+  if (self->inputStream) {
+    if (stream_.doConvertBuffer[1]) {
+      convertBuffer(stream_.userBuffer[1], (char*)buffer, stream_.convertInfo[1]);
+    } else {
+      memcpy(stream_.userBuffer[1], buffer, numFrames * self->frameSizeBytes[1]);
+    }
+  } else {
+    /* we should clear buffer here */
+    memset(stream_.userBuffer[1], 0, stream_.nUserChannels[1] * stream_.bufferSize * formatBytes( stream_.userFormat )); 
+  }
+
+  int cbReturnValue = callback(
+    stream_.userBuffer[0], // output
+    stream_.userBuffer[1], // input
+    stream_.bufferSize, 
+    streamTime, 
+    status, 
+    info->userData );
+
+  if (self->outputStream) {
+    if (stream_.doConvertBuffer[0]) {
+      convertBuffer((char*)buffer, stream_.userBuffer[0], stream_.convertInfo[0]);      
+    } else {
+      memcpy(buffer, stream_.userBuffer[0], numFrames * self->frameSizeBytes[0]);
+    }
+  } else {
+    // we need to clear buffer here
+    memset(buffer, 0, numFrames * self->frameSizeBytes[0]);
+  }
+
+  if ( cbReturnValue == 2 ) {
+    stream_.state = STREAM_STOPPING;
+  }
+
+  return true;
+
+}
+
+bool RtApiOboe::probeDeviceOpen( unsigned int device, StreamMode mode,
+                                  unsigned int channels, unsigned int firstChannel,
+                                  unsigned int sampleRate, RtAudioFormat format,
+                                  unsigned int *bufferSize, RtAudio::StreamOptions *options )
+{
+  OboeHandle *handle = 0;
+
+  if ( device != 0 ) {
+    errorText_ = "RtApiOboe::probeDeviceOpen device ID is invalid!";
+    return FAILURE;
+  }
+
+  if ( channels != 2 || firstChannel != 0 ) {
+    errorText_ = "RtApiOboe::probeDeviceOpen the device does not support the requested channel count.";
+    return FAILURE;
+  }
+
+  stream_.sampleRate = sampleRate;
+  stream_.bufferSize = *bufferSize;
+  stream_.device[mode] = device;
+  stream_.state = STREAM_STOPPED;
+  stream_.callbackInfo.object = (void *)this;
+
+  if ( stream_.apiHandle == 0 ) {
+    
+    try {
+      handle = new OboeHandle();
+      handle->info = &(stream_.callbackInfo);
+    } catch ( std::bad_alloc& ) {
+      errorText_ = "RtApiOboe::probeDeviceOpen: error allocating Handle memory.";
+      return FAILURE;
+    }
+    fprintf(stderr, "RtApiOboe: Creating new Stream (%d, %d)\n", sampleRate, *bufferSize);
+    
+    stream_.apiHandle = (void *) handle;
+    
+  }
+  else
+    handle = (OboeHandle *) stream_.apiHandle;
+
+  stream_.callbackInfo.apiInfo = handle;
+
+  AudioStreamBuilder sb;
+  
+  sb.setDeviceId(kUnspecified);
+  sb.setChannelCount(channels);
+  sb.setSampleRate(sampleRate);
+  sb.setFramesPerCallback(*bufferSize);
+  sb.setFormat(AudioFormat::Float);
+  sb.setAudioApi(AudioApi::OpenSLES); //TODO: We are forcing this to avoid the crackle output with Aaudio: Please Fix It
+  sb.setSharingMode(SharingMode::Shared);
+  sb.setPerformanceMode(PerformanceMode::LowLatency);
+
+  AudioFormat deviceFormat;
+  
+  if (mode == OUTPUT || mode == DUPLEX) {
+    sb.setDirection(Direction::Output);
+    sb.setCallback(handle);
+    if (sb.openStream(&(handle->outputStream)) != Result::OK) {
+      errorText_ = "RtApiOboe::probeDeviceOpen() could not open device output stream";
+      goto error;
+    }    
+    deviceFormat = handle->outputStream->getFormat();
+    stream_.latency[OUTPUT] = handle->outputStream->calculateLatencyMillis().value() * ((double)sampleRate / 1000.0);
+  }
+  
+  if (mode == INPUT || mode == DUPLEX) {
+    sb.setDirection(Direction::Input);
+    if (!handle->outputStream) // input stream only
+      sb.setCallback(handle);
+    if (sb.openStream(&(handle->inputStream)) != Result::OK) {
+      errorText_ = "RtApiOboe::probeDeviceOpen() coult not open device input stream";
+      goto error;
+    }    
+    deviceFormat = handle->inputStream->getFormat();
+    stream_.latency[INPUT] = handle->inputStream->calculateLatencyMillis().value() * ((double)sampleRate / 1000.0);
+  }
+
+  if (mode == INPUT && stream_.mode == OUTPUT)
+    stream_.mode = DUPLEX;
+  else if (mode == OUTPUT && stream_.mode == INPUT)
+    stream_.mode = DUPLEX;
+  else
+    stream_.mode = mode;
+
+  stream_.doByteSwap[mode] = false;
+
+  stream_.userFormat = format;
+
+  stream_.deviceFormat[mode] = (deviceFormat == AudioFormat::Float) ? RTAUDIO_FLOAT32 : RTAUDIO_SINT16;
+
+  stream_.nDeviceChannels[mode] = 2;
+
+  stream_.nUserChannels[mode] = channels;
+
+  stream_.channelOffset[mode] = firstChannel;
+
+  stream_.userInterleaved = false;
+  stream_.deviceInterleaved[mode] = false;
+
+  stream_.doConvertBuffer[mode] = (format != stream_.deviceFormat[mode] || channels != 2);
+  
+  TRACE("RtApiOboe: Buffer conversion for mode: %d is %d\n", mode, stream_.doConvertBuffer[mode]);
+
+  handle->frameSizeBytes[mode] = stream_.nUserChannels[mode] * formatBytes( stream_.deviceFormat[mode] );
+
+  if ( stream_.doConvertBuffer[mode] ) {
+    setConvertInfo( mode, 0 );
+  }
+  // Allocate necessary internal buffers.
+  unsigned long bufferBytes;
+  bufferBytes = stream_.nUserChannels[mode] * stream_.bufferSize * formatBytes( stream_.userFormat );  
+  stream_.userBuffer[mode] = (char *) calloc( bufferBytes, 1 );
+  if ( stream_.userBuffer[mode] == NULL ) {
+    errorText_ = "RtApiOboe::probeDeviceOpen: error allocating user buffer memory.";
+    goto error;
+  }
+
+  if ( stream_.doConvertBuffer[mode] ) {
+
+    bool makeBuffer = true;
+    if ( mode == OUTPUT )
+      bufferBytes = stream_.nDeviceChannels[0] * formatBytes( stream_.deviceFormat[0] );
+    else { // mode == INPUT
+      bufferBytes = stream_.nDeviceChannels[1] * formatBytes( stream_.deviceFormat[1] );
+      if ( stream_.mode == OUTPUT && stream_.deviceBuffer ) {
+        unsigned long bytesOut = stream_.nDeviceChannels[0] * formatBytes(stream_.deviceFormat[0]);
+        if ( bufferBytes < bytesOut ) makeBuffer = false;
+      }
+    }
+
+    if ( makeBuffer ) {
+      bufferBytes *= *bufferSize;
+      if ( stream_.deviceBuffer ) free( stream_.deviceBuffer );
+      stream_.deviceBuffer = (char *) calloc( bufferBytes, 1 );
+      if ( stream_.deviceBuffer == NULL ) {
+        errorText_ = "RtApiOboe::probeDeviceOpen: error allocating device buffer memory.";
+        goto error;
+      }
+    }
+  }
+
+  return SUCCESS;
+
+error:
+  if ( handle ) {
+    delete handle;
+    stream_.apiHandle = 0;
+    stream_.callbackInfo.apiInfo=0;
+  }
+
+  for ( int i=0; i<2; i++ ) {
+    if ( stream_.userBuffer[i] ) {
+      free( stream_.userBuffer[i] );
+      stream_.userBuffer[i] = 0;
+    }
+  }
+
+  if ( stream_.deviceBuffer ) {
+    free( stream_.deviceBuffer );
+    stream_.deviceBuffer = 0;
+  }
+
+  stream_.state = STREAM_CLOSED;
+  
+  return FAILURE;
+}
+
+
+//******************** End of __ANDROID_OBOE__ *********************//
+#endif
+
+
+#if defined(__RTAUDIO_LOOP__)
+
+RtApiLoop::RtApiLoop() : RtApi() {
+  memset(&loopback,0,sizeof(LoopbackInfo));
+}
+
+RtApiLoop::~RtApiLoop() {}
+
+RtAudio::DeviceInfo
+RtApiLoop::getDeviceInfo( unsigned int device ) {
+  static RtAudio::DeviceInfo info;
+  info.probed = false;
+  info.name = "Loopback Audio Device";
+  info.uid = "@loopbackdevice";
+  info.outputChannels = 64;
+  info.inputChannels  = 64;
+  info.duplexChannels = 64;
+  info.isDefaultOutput = true;
+  info.isDefaultInput  = true;
+  info.sampleRates.push_back(48000);
+  info.nativeFormats = RTAUDIO_FLOAT32;
+  return info;
+}
+
+void
+RtApiLoop::closeStream( void ) {
+  stream_.state = STREAM_CLOSED;
+}
+
+void
+RtApiLoop::startStream( void ) {
+  stream_.state = STREAM_RUNNING;
+}
+
+void
+RtApiLoop::stopStream( void )  {
+  stream_.state = STREAM_STOPPED;
+}
+
+void
+RtApiLoop::abortStream( void ) { 
+  stream_.state = STREAM_STOPPED; 
+}
+
+bool
+RtApiLoop::render(void *buffer, int numFrames) {
+
+  if (stream_.state == STREAM_STOPPED || stream_.state == STREAM_STOPPING) {
+    return false;
+  }
+  
+  if (stream_.state == STREAM_CLOSED) {
+    return false;
+  }
+
+  CallbackInfo        *info = (CallbackInfo*) &stream_.callbackInfo;
+  RtAudioCallback     callback = (RtAudioCallback)info->callback;
+  RtAudioStreamStatus status = 0;
+  double              streamTime = getStreamTime();
+    
+  if (callback(buffer, buffer, stream_.bufferSize, streamTime, status, info->userData) == 2) {
+    fprintf(stderr, "callbackEvent() stream abort was requested\n");
+    stream_.state =  STREAM_STOPPING;
+  }
+
+  return true;
+}
+
+bool
+RtApiLoop::probeDeviceOpen( unsigned int device, StreamMode mode, unsigned int channels, 
+                            unsigned int firstChannel, unsigned int sampleRate,
+                            RtAudioFormat format, unsigned int *bufferSize,
+                            RtAudio::StreamOptions *options ) {
+  
+
+  if (!loopback.open) {    
+    clearStreamInfo();
+    errorText_ = "RtApiLoop::probeDeviceOpen(): loopback is not initialized\n";
+    error( RtAudioError::WARNING );
+    return FAILURE;
+  }
+  
+  stream_.sampleRate = sampleRate;
+  stream_.bufferSize = *bufferSize;
+  stream_.device[mode] = 0;
+  stream_.callbackInfo.object = nullptr;
+  stream_.apiHandle = 0;
+  
+  stream_.doByteSwap[mode] = false;
+  stream_.userFormat = format;
+  stream_.deviceFormat[mode] = RTAUDIO_FLOAT32;
+  stream_.nDeviceChannels[mode] = 64;
+  stream_.nUserChannels[mode] = channels;
+  stream_.channelOffset[mode] = firstChannel;
+  stream_.deviceInterleaved[mode] = true;
+  stream_.userInterleaved = true;
+
+  if (mode == INPUT && stream_.mode == OUTPUT)
+    stream_.mode = DUPLEX;
+  else if (mode == OUTPUT && stream_.mode == INPUT)
+    stream_.mode = DUPLEX;
+  else
+    stream_.mode = mode;
+  
+  stream_.doConvertBuffer[mode] = false;
+
+  if (!loopback.open(
+        stream_.sampleRate,
+        stream_.nUserChannels[mode],
+        stream_.bufferSize,
+        mode, loopback.userData)) {
+    errorText_ = "RtApiLoop::probeDeviceOpen(): loopback could not be opened\n";
+    error( RtAudioError::WARNING );
+    return FAILURE;
+  }
+  
+  return SUCCESS;
+}
+
+//******************** End of __RTAUDIO_LOOP__ *********************//
 #endif
 
 

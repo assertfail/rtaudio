@@ -279,6 +279,10 @@ class RTAUDIO_DLL_PUBLIC RtAudio
     WINDOWS_ASIO,   /*!< The Steinberg Audio Stream I/O API. */
     WINDOWS_WASAPI, /*!< The Microsoft WASAPI API. */
     WINDOWS_DS,     /*!< The Microsoft DirectSound API. */
+    IOS_REMOTEIO,   /*!< Apple IOS RemoteIO API. */
+    ANDROID_SLES,   /*!< Android OpenSLES API. */
+    ANDROID_OBOE,   /*!< Android Oboe API. */
+    RTAUDIO_LOOP,   /*!< Loopback API. */
     RTAUDIO_DUMMY,  /*!< A compilable but non-functional API. */
     NUM_APIS        /*!< Number of values in this enum. */
   };
@@ -287,6 +291,7 @@ class RTAUDIO_DLL_PUBLIC RtAudio
   struct DeviceInfo {
     unsigned int ID{};              /*!< Device ID used to specify a device to RtAudio. */
     std::string name;               /*!< Character string device name. */
+    std::string systemid;           /*!< Character string device operating system identity */
     unsigned int outputChannels{};  /*!< Maximum output channels supported by device. */
     unsigned int inputChannels{};   /*!< Maximum input channels supported by device. */
     unsigned int duplexChannels{};  /*!< Maximum simultaneous input/output channels supported by device. */
